@@ -1,20 +1,29 @@
 # coding: utf-8
 # pylint: disable=too-many-arguments, too-many-branches, invalid-name
-# pylint: disable=too-many-branches, too-many-lines, W0141
+# pylint: disable=too-many-branches, too-many-lines, too-many-locals
+# pylint: disable=too-many-public-methods
 """Core XGBoost Library."""
-from __future__ import absolute_import
-
 import collections
+# pylint: disable=no-name-in-module,import-error
+from collections.abc import Mapping  # Python 3
+# pylint: enable=no-name-in-module,import-error
 import ctypes
 import os
 import re
 import sys
+import warnings
+import json
 
 import numpy as np
 import scipy.sparse
 
-from .compat import STRING_TYPES, PY3, DataFrame, MultiIndex, py_str, PANDAS_INSTALLED, DataTable
+from .compat import (
+    STRING_TYPES, PY3, DataFrame, MultiIndex, py_str,
+    PANDAS_INSTALLED, DataTable,
+    CUDF_INSTALLED, CUDF_DataFrame, CUDF_Series, CUDF_MultiIndex,
+    os_fspath, os_PathLike)
 from .libpath import find_lib_path
+
 
 # c_bst_ulong corresponds to bst_ulong defined in xgboost/c_api.h
 c_bst_ulong = ctypes.c_uint64
@@ -22,7 +31,6 @@ c_bst_ulong = ctypes.c_uint64
 
 class XGBoostError(Exception):
     """Error thrown by xgboost trainer."""
-    pass
 
 
 class EarlyStopException(Exception):
@@ -59,18 +67,16 @@ def from_pystr_to_cstr(data):
         list of str
     """
 
-    if isinstance(data, list):
-        pointers = (ctypes.c_char_p * len(data))()
-        if PY3:
-            data = [bytes(d, 'utf-8') for d in data]
-        else:
-            data = [d.encode('utf-8') if isinstance(d, unicode) else d
-                    for d in data]
-        pointers[:] = data
-        return pointers
-    else:
-        # copy from above when we actually use it
+    if not isinstance(data, list):
         raise NotImplementedError
+    pointers = (ctypes.c_char_p * len(data))()
+    if PY3:
+        data = [bytes(d, 'utf-8') for d in data]
+    else:
+        data = [d.encode('utf-8') if isinstance(d, unicode) else d  # pylint: disable=undefined-variable
+                for d in data]
+    pointers[:] = data
+    return pointers
 
 
 def from_cstr_to_pystr(data, length):
@@ -96,8 +102,32 @@ def from_cstr_to_pystr(data, length):
             try:
                 res.append(str(data[i].decode('ascii')))
             except UnicodeDecodeError:
+                # pylint: disable=undefined-variable
                 res.append(unicode(data[i].decode('utf-8')))
     return res
+
+
+def _expect(expectations, got):
+    """Translate input error into string.
+
+    Parameters
+    ----------
+    expectations: sequence
+        a list of expected value.
+    got:
+        actual input
+
+    Returns
+    -------
+    msg: str
+    """
+    msg = 'Expecting '
+    for t in range(len(expectations) - 1):
+        msg += str(expectations[t])
+        msg += ' or '
+    msg += str(expectations[-1])
+    msg += '.  Got ' + str(got)
+    return msg
 
 
 def _log_callback(msg):
@@ -115,7 +145,7 @@ def _get_log_callback_func():
 def _load_lib():
     """Load xgboost Library."""
     lib_paths = find_lib_path()
-    if len(lib_paths) == 0:
+    if not lib_paths:
         return None
     try:
         pathBackup = os.environ['PATH'].split(os.pathsep)
@@ -125,8 +155,10 @@ def _load_lib():
     os_error_list = []
     for lib_path in lib_paths:
         try:
-            # needed when the lib is linked with non-system-available dependencies
-            os.environ['PATH'] = os.pathsep.join(pathBackup + [os.path.dirname(lib_path)])
+            # needed when the lib is linked with non-system-available
+            # dependencies
+            os.environ['PATH'] = os.pathsep.join(
+                pathBackup + [os.path.dirname(lib_path)])
             lib = ctypes.cdll.LoadLibrary(lib_path)
             lib_success = True
         except OSError as e:
@@ -167,12 +199,11 @@ def _check_call(ret):
         return value from API calls
     """
     if ret != 0:
-        raise XGBoostError(_LIB.XGBGetLastError())
+        raise XGBoostError(py_str(_LIB.XGBGetLastError()))
 
 
 def ctypes2numpy(cptr, length, dtype):
-    """Convert a ctypes pointer array to a numpy array.
-    """
+    """Convert a ctypes pointer array to a numpy array."""
     NUMPY_TO_CTYPES_MAPPING = {
         np.float32: ctypes.c_float,
         np.uint32: ctypes.c_uint,
@@ -206,9 +237,49 @@ def c_str(string):
 
 def c_array(ctype, values):
     """Convert a python string to c array."""
-    if isinstance(values, np.ndarray) and values.dtype.itemsize == ctypes.sizeof(ctype):
+    if (isinstance(values, np.ndarray)
+            and values.dtype.itemsize == ctypes.sizeof(ctype)):
         return (ctype * len(values)).from_buffer_copy(values)
     return (ctype * len(values))(*values)
+
+
+def _use_columnar_initializer(data):
+    """Whether should we use columnar format initializer (pass data in as json
+    string).  Currently cudf is the only valid option.  For other dataframe
+    types, use their sepcific API instead.
+    """
+    if CUDF_INSTALLED and (isinstance(data, (CUDF_DataFrame, CUDF_Series))):
+        return True
+    return False
+
+
+def _extract_interface_from_cudf_series(data):
+    """This returns the array interface from the cudf series. This function
+    should be upstreamed to cudf.
+    """
+    interface = data.__cuda_array_interface__
+    if data.has_null_mask:
+        interface['mask'] = interface['mask'].__cuda_array_interface__
+    return interface
+
+
+def _extract_interface_from_cudf(df):
+    """This function should be upstreamed to cudf."""
+    if not _use_columnar_initializer(df):
+        raise ValueError('Only cudf is supported for initializing as json ' +
+                         'columnar format.  For other libraries please ' +
+                         'refer to specific API.')
+
+    array_interfaces = []
+    if isinstance(df, CUDF_DataFrame):
+        for col in df.columns:
+            array_interfaces.append(
+                _extract_interface_from_cudf_series(df[col]))
+    else:
+        array_interfaces.append(_extract_interface_from_cudf_series(df))
+
+    interfaces = bytes(json.dumps(array_interfaces, indent=2), 'utf-8')
+    return interfaces
 
 
 PANDAS_DTYPE_MAPPER = {'int8': 'int', 'int16': 'int', 'int32': 'int', 'int64': 'int',
@@ -218,14 +289,14 @@ PANDAS_DTYPE_MAPPER = {'int8': 'int', 'int16': 'int', 'int32': 'int', 'int64': '
 
 
 def _maybe_pandas_data(data, feature_names, feature_types):
-    """ Extract internal data from pd.DataFrame for DMatrix data """
+    """Extract internal data from pd.DataFrame for DMatrix data"""
 
-    if not isinstance(data, DataFrame):
+    if not (PANDAS_INSTALLED and isinstance(data, DataFrame)):
         return data, feature_names, feature_types
 
     data_dtypes = data.dtypes
     if not all(dtype.name in PANDAS_DTYPE_MAPPER for dtype in data_dtypes):
-        bad_fields = [data.columns[i] for i, dtype in
+        bad_fields = [str(data.columns[i]) for i, dtype in
                       enumerate(data_dtypes) if dtype.name not in PANDAS_DTYPE_MAPPER]
 
         msg = """DataFrame.dtypes for data must be int, float or bool.
@@ -235,7 +306,7 @@ def _maybe_pandas_data(data, feature_names, feature_types):
     if feature_names is None:
         if isinstance(data.columns, MultiIndex):
             feature_names = [
-                ' '.join(map(str, i))
+                ' '.join([str(x) for x in i])
                 for i in data.columns
             ]
         else:
@@ -250,20 +321,46 @@ def _maybe_pandas_data(data, feature_names, feature_types):
 
 
 def _maybe_pandas_label(label):
-    """ Extract internal data from pd.DataFrame for DMatrix label """
+    """Extract internal data from pd.DataFrame for DMatrix label."""
 
-    if isinstance(label, DataFrame):
+    if PANDAS_INSTALLED and isinstance(label, DataFrame):
         if len(label.columns) > 1:
-            raise ValueError('DataFrame for label cannot have multiple columns')
+            raise ValueError(
+                'DataFrame for label cannot have multiple columns')
 
         label_dtypes = label.dtypes
-        if not all(dtype.name in PANDAS_DTYPE_MAPPER for dtype in label_dtypes):
-            raise ValueError('DataFrame.dtypes for label must be int, float or bool')
-        else:
-            label = label.values.astype('float')
+        if not all(dtype.name in PANDAS_DTYPE_MAPPER
+                   for dtype in label_dtypes):
+            raise ValueError(
+                'DataFrame.dtypes for label must be int, float or bool')
+        label = label.values.astype('float')
     # pd.Series can be passed to xgb as it is
 
     return label
+
+
+def _maybe_cudf_dataframe(data, feature_names, feature_types):
+    """Extract internal data from cudf.DataFrame for DMatrix data."""
+    if not (CUDF_INSTALLED and isinstance(data,
+                                          (CUDF_DataFrame, CUDF_Series))):
+        return data, feature_names, feature_types
+    if feature_names is None:
+        if isinstance(data, CUDF_Series):
+            feature_names = [data.name]
+        elif isinstance(data.columns, CUDF_MultiIndex):
+            feature_names = [
+                ' '.join([str(x) for x in i])
+                for i in data.columns
+            ]
+        else:
+            feature_names = data.columns.format()
+    if feature_types is None:
+        if isinstance(data, CUDF_Series):
+            dtypes = [data.dtype]
+        else:
+            dtypes = data.dtypes
+        feature_types = [PANDAS_DTYPE_MAPPER[d.name] for d in dtypes]
+    return data, feature_names, feature_types
 
 
 DT_TYPE_MAPPER = {'bool': 'bool', 'int': 'int', 'real': 'float'}
@@ -272,17 +369,15 @@ DT_TYPE_MAPPER2 = {'bool': 'i', 'int': 'int', 'real': 'float'}
 
 
 def _maybe_dt_data(data, feature_names, feature_types):
-    """
-    Validate feature names and types if data table
-    """
+    """Validate feature names and types if data table"""
     if not isinstance(data, DataTable):
         return data, feature_names, feature_types
 
     data_types_names = tuple(lt.name for lt in data.ltypes)
-    if not all(type_name in DT_TYPE_MAPPER for type_name in data_types_names):
-        bad_fields = [data.names[i] for i, type_name in
-                      enumerate(data_types_names) if type_name not in DT_TYPE_MAPPER]
-
+    bad_fields = [data.names[i]
+                  for i, type_name in enumerate(data_types_names)
+                  if type_name not in DT_TYPE_MAPPER]
+    if bad_fields:
         msg = """DataFrame.types for data must be int, float or bool.
                 Did not expect the data types in fields """
         raise ValueError(msg + ', '.join(bad_fields))
@@ -293,14 +388,13 @@ def _maybe_dt_data(data, feature_names, feature_types):
         # always return stypes for dt ingestion
         if feature_types is not None:
             raise ValueError('DataTable has own feature types, cannot pass them in')
-        else:
-            feature_types = np.vectorize(DT_TYPE_MAPPER2.get)(data_types_names)
+        feature_types = np.vectorize(DT_TYPE_MAPPER2.get)(data_types_names)
 
     return data, feature_names, feature_types
 
 
 def _maybe_dt_array(array):
-    """ Extract numpy array from single column data table """
+    """Extract numpy array from single column data table"""
     if not isinstance(array, DataTable) or array is None:
         return array
 
@@ -309,9 +403,24 @@ def _maybe_dt_array(array):
 
     # below requires new dt version
     # extract first column
-    array = array.tonumpy()[:, 0].astype('float')
+    array = array.to_numpy()[:, 0].astype('float')
 
     return array
+
+
+def _convert_dataframes(data, feature_names, feature_types):
+    data, feature_names, feature_types = _maybe_pandas_data(data,
+                                                            feature_names,
+                                                            feature_types)
+
+    data, feature_names, feature_types = _maybe_dt_data(data,
+                                                        feature_names,
+                                                        feature_types)
+
+    data, feature_names, feature_types = _maybe_cudf_dataframe(
+        data, feature_names, feature_types)
+
+    return data, feature_names, feature_types
 
 
 class DMatrix(object):
@@ -329,20 +438,30 @@ class DMatrix(object):
                  weight=None, silent=False,
                  feature_names=None, feature_types=None,
                  nthread=None):
-        """
-        Parameters
+        """Parameters
         ----------
-        data : string/numpy array/scipy.sparse/pd.DataFrame/DataTable
+        data : os.PathLike/string/numpy.array/scipy.sparse/pd.DataFrame/
+               dt.Frame/cudf.DataFrame
             Data source of DMatrix.
-            When data is string type, it represents the path libsvm format txt file,
-            or binary file that xgboost can read from.
-        label : list or numpy 1-D array, optional
+            When data is string or os.PathLike type, it represents the path
+            libsvm format txt file, csv file (by specifying uri parameter
+            'path_to_csv?format=csv'), or binary file that xgboost can read
+            from.
+        label : list, numpy 1-D array or cudf.DataFrame, optional
             Label of the training data.
         missing : float, optional
-            Value in the data which needs to be present as a missing value. If
-            None, defaults to np.nan.
-        weight : list or numpy 1-D array , optional
+            Value in the input data which needs to be present as a missing
+            value. If None, defaults to np.nan.
+        weight : list, numpy 1-D array or cudf.DataFrame , optional
             Weight for each instance.
+
+            .. note:: For ranking task, weights are per-group.
+
+                In ranking task, one weight is assigned to each group (not each data
+                point). This is because we only care about the relative ordering of
+                data points within each group, so it doesn't make sense to assign
+                weights to individual data points.
+
         silent : boolean, optional
             Whether print messages during construction
         feature_names : list, optional
@@ -363,22 +482,23 @@ class DMatrix(object):
                 self._feature_types = feature_types
             return
 
-        data, feature_names, feature_types = _maybe_pandas_data(data,
-                                                                feature_names,
-                                                                feature_types)
+        if isinstance(data, list):
+            raise TypeError('Input data can not be a list.')
 
-        data, feature_names, feature_types = _maybe_dt_data(data,
-                                                            feature_names,
-                                                            feature_types)
+        data, feature_names, feature_types = _convert_dataframes(
+            data, feature_names, feature_types
+        )
+
         label = _maybe_pandas_label(label)
         label = _maybe_dt_array(label)
         weight = _maybe_dt_array(weight)
 
-        if isinstance(data, STRING_TYPES):
-            self.handle = ctypes.c_void_p()
-            _check_call(_LIB.XGDMatrixCreateFromFile(c_str(data),
+        if isinstance(data, (STRING_TYPES, os_PathLike)):
+            handle = ctypes.c_void_p()
+            _check_call(_LIB.XGDMatrixCreateFromFile(c_str(os_fspath(data)),
                                                      ctypes.c_int(silent),
-                                                     ctypes.byref(self.handle)))
+                                                     ctypes.byref(handle)))
+            self.handle = handle
         elif isinstance(data, scipy.sparse.csr_matrix):
             self._init_from_csr(data)
         elif isinstance(data, scipy.sparse.csc_matrix):
@@ -387,22 +507,28 @@ class DMatrix(object):
             self._init_from_npy2d(data, missing, nthread)
         elif isinstance(data, DataTable):
             self._init_from_dt(data, nthread)
+        elif _use_columnar_initializer(data):
+            self._init_from_columnar(data, missing)
         else:
             try:
                 csr = scipy.sparse.csr_matrix(data)
                 self._init_from_csr(csr)
-            except:
+            except Exception:
                 raise TypeError('can not initialize DMatrix from'
                                 ' {}'.format(type(data).__name__))
 
         if label is not None:
             if isinstance(label, np.ndarray):
                 self.set_label_npy2d(label)
+            elif _use_columnar_initializer(label):
+                self.set_interface_info('label', label)
             else:
                 self.set_label(label)
         if weight is not None:
             if isinstance(weight, np.ndarray):
                 self.set_weight_npy2d(weight)
+            elif _use_columnar_initializer(label):
+                self.set_interface_info('weight', weight)
             else:
                 self.set_weight(weight)
 
@@ -410,38 +536,35 @@ class DMatrix(object):
         self.feature_types = feature_types
 
     def _init_from_csr(self, csr):
-        """
-        Initialize data from a CSR matrix.
-        """
+        """Initialize data from a CSR matrix."""
         if len(csr.indices) != len(csr.data):
             raise ValueError('length mismatch: {} vs {}'.format(len(csr.indices), len(csr.data)))
-        self.handle = ctypes.c_void_p()
+        handle = ctypes.c_void_p()
         _check_call(_LIB.XGDMatrixCreateFromCSREx(c_array(ctypes.c_size_t, csr.indptr),
                                                   c_array(ctypes.c_uint, csr.indices),
                                                   c_array(ctypes.c_float, csr.data),
                                                   ctypes.c_size_t(len(csr.indptr)),
                                                   ctypes.c_size_t(len(csr.data)),
                                                   ctypes.c_size_t(csr.shape[1]),
-                                                  ctypes.byref(self.handle)))
+                                                  ctypes.byref(handle)))
+        self.handle = handle
 
     def _init_from_csc(self, csc):
-        """
-        Initialize data from a CSC matrix.
-        """
+        """Initialize data from a CSC matrix."""
         if len(csc.indices) != len(csc.data):
             raise ValueError('length mismatch: {} vs {}'.format(len(csc.indices), len(csc.data)))
-        self.handle = ctypes.c_void_p()
+        handle = ctypes.c_void_p()
         _check_call(_LIB.XGDMatrixCreateFromCSCEx(c_array(ctypes.c_size_t, csc.indptr),
                                                   c_array(ctypes.c_uint, csc.indices),
                                                   c_array(ctypes.c_float, csc.data),
                                                   ctypes.c_size_t(len(csc.indptr)),
                                                   ctypes.c_size_t(len(csc.data)),
                                                   ctypes.c_size_t(csc.shape[0]),
-                                                  ctypes.byref(self.handle)))
+                                                  ctypes.byref(handle)))
+        self.handle = handle
 
     def _init_from_npy2d(self, mat, missing, nthread):
-        """
-        Initialize data from a 2-D numpy matrix.
+        """Initialize data from a 2-D numpy matrix.
 
         If ``mat`` does not have ``order='C'`` (aka row-major) or is not contiguous,
         a temporary copy will be made.
@@ -452,12 +575,13 @@ class DMatrix(object):
         and type if memory use is a concern.
         """
         if len(mat.shape) != 2:
-            raise ValueError('Input numpy.ndarray must be 2 dimensional')
-        # flatten the array by rows and ensure it is float32.
-        # we try to avoid data copies if possible (reshape returns a view when possible
-        # and we explicitly tell np.array to try and avoid copying)
+            raise ValueError('Expecting 2 dimensional numpy.ndarray, got: ',
+                             mat.shape)
+        # flatten the array by rows and ensure it is float32.  we try to avoid
+        # data copies if possible (reshape returns a view when possible and we
+        # explicitly tell np.array to try and avoid copying)
         data = np.array(mat.reshape(mat.size), copy=False, dtype=np.float32)
-        self.handle = ctypes.c_void_p()
+        handle = ctypes.c_void_p()
         missing = missing if missing is not None else np.nan
         if nthread is None:
             _check_call(_LIB.XGDMatrixCreateFromMat(
@@ -465,45 +589,60 @@ class DMatrix(object):
                 c_bst_ulong(mat.shape[0]),
                 c_bst_ulong(mat.shape[1]),
                 ctypes.c_float(missing),
-                ctypes.byref(self.handle)))
+                ctypes.byref(handle)))
         else:
             _check_call(_LIB.XGDMatrixCreateFromMat_omp(
                 data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 c_bst_ulong(mat.shape[0]),
                 c_bst_ulong(mat.shape[1]),
                 ctypes.c_float(missing),
-                ctypes.byref(self.handle),
+                ctypes.byref(handle),
                 nthread))
+        self.handle = handle
 
     def _init_from_dt(self, data, nthread):
-        """
-        Initialize data from a DataTable
-        """
-        cols = []
+        """Initialize data from a datatable Frame."""
         ptrs = (ctypes.c_void_p * data.ncols)()
-        for icol in range(data.ncols):
-            col = data.internal.column(icol)
-            cols.append(col)
-            # int64_t (void*)
-            ptr = col.data_pointer
-            ptrs[icol] = ctypes.c_void_p(ptr)
+        if hasattr(data, "internal") and hasattr(data.internal, "column"):
+            # datatable>0.8.0
+            for icol in range(data.ncols):
+                col = data.internal.column(icol)
+                ptr = col.data_pointer
+                ptrs[icol] = ctypes.c_void_p(ptr)
+        else:
+            # datatable<=0.8.0
+            from datatable.internal import frame_column_data_r  # pylint: disable=no-name-in-module,import-error
+            for icol in range(data.ncols):
+                ptrs[icol] = frame_column_data_r(data, icol)
 
         # always return stypes for dt ingestion
         feature_type_strings = (ctypes.c_char_p * data.ncols)()
         for icol in range(data.ncols):
             feature_type_strings[icol] = ctypes.c_char_p(data.stypes[icol].name.encode('utf-8'))
 
-        self.handle = ctypes.c_void_p()
-
+        handle = ctypes.c_void_p()
         _check_call(_LIB.XGDMatrixCreateFromDT(
             ptrs, feature_type_strings,
             c_bst_ulong(data.shape[0]),
             c_bst_ulong(data.shape[1]),
-            ctypes.byref(self.handle),
+            ctypes.byref(handle),
             nthread))
+        self.handle = handle
+
+    def _init_from_columnar(self, df, missing):
+        """Initialize DMatrix from columnar memory format."""
+        interfaces = _extract_interface_from_cudf(df)
+        handle = ctypes.c_void_p()
+        has_missing = missing is not None
+        missing = missing if has_missing else np.nan
+        _check_call(
+            _LIB.XGDMatrixCreateFromArrayInterfaces(
+                interfaces, ctypes.c_int32(has_missing),
+                ctypes.c_float(missing), ctypes.byref(handle)))
+        self.handle = handle
 
     def __del__(self):
-        if hasattr(self, "handle") and self.handle is not None:
+        if hasattr(self, "handle") and self.handle:
             _check_call(_LIB.XGDMatrixFree(self.handle))
             self.handle = None
 
@@ -560,11 +699,21 @@ class DMatrix(object):
         data: numpy array
             The array of data to be set
         """
+        if isinstance(data, np.ndarray):
+            self.set_float_info_npy2d(field, data)
+            return
         c_data = c_array(ctypes.c_float, data)
         _check_call(_LIB.XGDMatrixSetFloatInfo(self.handle,
                                                c_str(field),
                                                c_data,
                                                c_bst_ulong(len(data))))
+
+    def set_interface_info(self, field, data):
+        """Set info type peoperty into DMatrix."""
+        interfaces = _extract_interface_from_cudf(data)
+        _check_call(_LIB.XGDMatrixSetInfoFromInterface(self.handle,
+                                                       c_str(field),
+                                                       interfaces))
 
     def set_float_info_npy2d(self, field, data):
         """Set float type property into the DMatrix
@@ -578,7 +727,16 @@ class DMatrix(object):
         data: numpy array
             The array of data to be set
         """
-        data = np.array(data, copy=False, dtype=np.float32)
+        try:
+            if not data.flags.c_contiguous:
+                warnings.warn("Use subset (sliced data) of np.ndarray is not recommended " +
+                              "because it will generate extra copies and increase " +
+                              "memory consumption")
+                data = np.array(data, copy=True, dtype=np.float32)
+            else:
+                data = np.array(data, copy=False, dtype=np.float32)
+        except AttributeError:
+            data = np.array(data, copy=False, dtype=np.float32)
         c_data = data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         _check_call(_LIB.XGDMatrixSetFloatInfo(self.handle,
                                                c_str(field),
@@ -596,23 +754,34 @@ class DMatrix(object):
         data: numpy array
             The array of data to be set
         """
+        try:
+            if not data.flags.c_contiguous:
+                warnings.warn("Use subset (sliced data) of np.ndarray is not recommended " +
+                              "because it will generate extra copies and increase " +
+                              "memory consumption")
+                data = np.array(data, copy=True, dtype=ctypes.c_uint)
+            else:
+                data = np.array(data, copy=False, dtype=ctypes.c_uint)
+        except AttributeError:
+            data = np.array(data, copy=False, dtype=ctypes.c_uint)
         _check_call(_LIB.XGDMatrixSetUIntInfo(self.handle,
                                               c_str(field),
                                               c_array(ctypes.c_uint, data),
                                               c_bst_ulong(len(data))))
 
     def save_binary(self, fname, silent=True):
-        """Save DMatrix to an XGBoost buffer.
+        """Save DMatrix to an XGBoost buffer.  Saved binary can be later loaded
+        by providing the path to :py:func:`xgboost.DMatrix` as input.
 
         Parameters
         ----------
-        fname : string
+        fname : string or os.PathLike
             Name of the output buffer file.
         silent : bool (optional; default: True)
             If set, the output is suppressed.
         """
         _check_call(_LIB.XGDMatrixSaveBinary(self.handle,
-                                             c_str(fname),
+                                             c_str(os_fspath(fname)),
                                              ctypes.c_int(silent)))
 
     def set_label(self, label):
@@ -643,6 +812,13 @@ class DMatrix(object):
         ----------
         weight : array like
             Weight for each data point
+
+            .. note:: For ranking task, weights are per-group.
+
+                In ranking task, one weight is assigned to each group (not each data
+                point). This is because we only care about the relative ordering of
+                data points within each group, so it doesn't make sense to assign
+                weights to individual data points.
         """
         self.set_float_info('weight', weight)
 
@@ -654,6 +830,13 @@ class DMatrix(object):
         ----------
         weight : array like
             Weight for each data point in numpy 2D array
+
+            .. note:: For ranking task, weights are per-group.
+
+                In ranking task, one weight is assigned to each group (not each data
+                point). This is because we only care about the relative ordering of
+                data points within each group, so it doesn't make sense to assign
+                weights to individual data points.
         """
         self.set_float_info_npy2d('weight', weight)
 
@@ -671,7 +854,10 @@ class DMatrix(object):
         margin: array like
             Prediction margin of each datapoint
         """
-        self.set_float_info('base_margin', margin)
+        if _use_columnar_initializer(margin):
+            self.set_interface_info('base_margin', margin)
+        else:
+            self.set_float_info('base_margin', margin)
 
     def set_group(self, group):
         """Set group size of DMatrix (used for ranking).
@@ -681,9 +867,10 @@ class DMatrix(object):
         group : array like
             Group size of each group
         """
-        _check_call(_LIB.XGDMatrixSetGroup(self.handle,
-                                           c_array(ctypes.c_uint, group),
-                                           c_bst_ulong(len(group))))
+        if _use_columnar_initializer(group):
+            self.set_interface_info('group', group)
+        else:
+            self.set_uint_info('group', group)
 
     def get_label(self):
         """Get the label of the DMatrix.
@@ -736,13 +923,15 @@ class DMatrix(object):
                                          ctypes.byref(ret)))
         return ret.value
 
-    def slice(self, rindex):
+    def slice(self, rindex, allow_groups=False):
         """Slice the DMatrix and return a new DMatrix that only contains `rindex`.
 
         Parameters
         ----------
         rindex : list
             List of indices to be selected.
+        allow_groups : boolean
+            Allow slicing of a matrix with a groups attribute
 
         Returns
         -------
@@ -752,10 +941,11 @@ class DMatrix(object):
         res = DMatrix(None, feature_names=self.feature_names,
                       feature_types=self.feature_types)
         res.handle = ctypes.c_void_p()
-        _check_call(_LIB.XGDMatrixSliceDMatrix(self.handle,
-                                               c_array(ctypes.c_int, rindex),
-                                               c_bst_ulong(len(rindex)),
-                                               ctypes.byref(res.handle)))
+        _check_call(_LIB.XGDMatrixSliceDMatrixEx(self.handle,
+                                                 c_array(ctypes.c_int, rindex),
+                                                 c_bst_ulong(len(rindex)),
+                                                 ctypes.byref(res.handle),
+                                                 ctypes.c_int(1 if allow_groups else 0)))
         return res
 
     @property
@@ -767,7 +957,8 @@ class DMatrix(object):
         feature_names : list or None
         """
         if self._feature_names is None:
-            self._feature_names = ['f{0}'.format(i) for i in range(self.num_col())]
+            self._feature_names = ['f{0}'.format(i)
+                                   for i in range(self.num_col())]
         return self._feature_names
 
     @property
@@ -793,7 +984,7 @@ class DMatrix(object):
             # validate feature name
             try:
                 if not isinstance(feature_names, str):
-                    feature_names = [n for n in iter(feature_names)]
+                    feature_names = list(feature_names)
                 else:
                     feature_names = [feature_names]
             except TypeError:
@@ -808,7 +999,7 @@ class DMatrix(object):
             if not all(isinstance(f, STRING_TYPES) and
                        not any(x in f for x in set(('[', ']', '<')))
                        for f in feature_names):
-                raise ValueError('feature_names may not contain [, ] or <')
+                raise ValueError('feature_names must be string, and may not contain [, ] or <')
         else:
             # reset feature_types also
             self.feature_types = None
@@ -837,7 +1028,7 @@ class DMatrix(object):
 
             try:
                 if not isinstance(feature_types, str):
-                    feature_types = [n for n in iter(feature_types)]
+                    feature_types = list(feature_types)
                 else:
                     feature_types = [feature_types]
             except TypeError:
@@ -855,6 +1046,7 @@ class DMatrix(object):
 
 
 class Booster(object):
+    # pylint: disable=too-many-public-methods
     """A Booster of XGBoost.
 
     Booster is the model of xgboost, that contains low level routines for
@@ -872,40 +1064,59 @@ class Booster(object):
             Parameters for boosters.
         cache : list
             List of cache items.
-        model_file : string
+        model_file : string or os.PathLike
             Path to the model file.
         """
         for d in cache:
             if not isinstance(d, DMatrix):
-                raise TypeError('invalid cache item: {}'.format(type(d).__name__))
+                raise TypeError('invalid cache item: {}'.format(type(d).__name__), cache)
             self._validate_features(d)
 
         dmats = c_array(ctypes.c_void_p, [d.handle for d in cache])
         self.handle = ctypes.c_void_p()
         _check_call(_LIB.XGBoosterCreate(dmats, c_bst_ulong(len(cache)),
                                          ctypes.byref(self.handle)))
-        self.set_param({'seed': 0})
         self.set_param(params or {})
         if (params is not None) and ('booster' in params):
             self.booster = params['booster']
         else:
             self.booster = 'gbtree'
-        if model_file is not None:
+        if isinstance(model_file, Booster):
+            assert self.handle is not None
+            # We use the pickle interface for getting memory snapshot from
+            # another model, and load the snapshot with this booster.
+            state = model_file.__getstate__()
+            handle = state['handle']
+            del state['handle']
+            ptr = (ctypes.c_char * len(handle)).from_buffer(handle)
+            length = c_bst_ulong(len(handle))
+            _check_call(
+                _LIB.XGBoosterUnserializeFromBuffer(self.handle, ptr, length))
+            self.__dict__.update(state)
+        elif isinstance(model_file, (STRING_TYPES, os_PathLike)):
             self.load_model(model_file)
+        elif model_file is None:
+            pass
+        else:
+            raise TypeError('Unknown type:', model_file)
 
     def __del__(self):
-        if self.handle is not None:
+        if hasattr(self, 'handle') and self.handle is not None:
             _check_call(_LIB.XGBoosterFree(self.handle))
             self.handle = None
 
     def __getstate__(self):
-        # can't pickle ctypes pointers
-        # put model content in bytearray
+        # can't pickle ctypes pointers, put model content in bytearray
         this = self.__dict__.copy()
         handle = this['handle']
         if handle is not None:
-            raw = self.save_raw()
-            this["handle"] = raw
+            length = c_bst_ulong()
+            cptr = ctypes.POINTER(ctypes.c_char)()
+            _check_call(_LIB.XGBoosterSerializeToBuffer(self.handle,
+                                                        ctypes.byref(length),
+                                                        ctypes.byref(cptr)))
+            buf = ctypes2buffer(cptr, length.value)
+            this["handle"] = buf
         return this
 
     def __setstate__(self, state):
@@ -915,19 +1126,44 @@ class Booster(object):
             buf = handle
             dmats = c_array(ctypes.c_void_p, [])
             handle = ctypes.c_void_p()
-            _check_call(_LIB.XGBoosterCreate(dmats, c_bst_ulong(0), ctypes.byref(handle)))
+            _check_call(_LIB.XGBoosterCreate(
+                dmats, c_bst_ulong(0), ctypes.byref(handle)))
             length = c_bst_ulong(len(buf))
             ptr = (ctypes.c_char * len(buf)).from_buffer(buf)
-            _check_call(_LIB.XGBoosterLoadModelFromBuffer(handle, ptr, length))
+            _check_call(
+                _LIB.XGBoosterUnserializeFromBuffer(handle, ptr, length))
             state['handle'] = handle
         self.__dict__.update(state)
-        self.set_param({'seed': 0})
+
+    def save_config(self):
+        '''Output internal parameter configuration of Booster as a JSON
+        string.'''
+        json_string = ctypes.c_char_p()
+        length = c_bst_ulong()
+        _check_call(_LIB.XGBoosterSaveJsonConfig(
+            self.handle,
+            ctypes.byref(length),
+            ctypes.byref(json_string)))
+        json_string = json_string.value.decode()
+        return json_string
+
+    def load_config(self, config):
+        '''Load configuration returned by `save_config`.'''
+        assert isinstance(config, str)
+        _check_call(_LIB.XGBoosterLoadJsonConfig(
+            self.handle,
+            c_str(config)))
 
     def __copy__(self):
         return self.__deepcopy__(None)
 
     def __deepcopy__(self, _):
-        return Booster(model_file=self.save_raw())
+        '''Return a copy of booster.  Caches for DMatrix are not copied so continue
+        training on copied booster will result in lower performance and
+        slightly different result.
+
+        '''
+        return Booster(model_file=self)
 
     def copy(self):
         """Copy the booster object.
@@ -975,8 +1211,7 @@ class Booster(object):
             self.handle, c_str(key), ctypes.byref(ret), ctypes.byref(success)))
         if success.value != 0:
             return py_str(ret.value)
-        else:
-            return None
+        return None
 
     def attributes(self):
         """Get attributes stored in the Booster as a dictionary.
@@ -992,8 +1227,7 @@ class Booster(object):
                                                ctypes.byref(length),
                                                ctypes.byref(sarr)))
         attr_names = from_cstr_to_pystr(sarr, length)
-        res = dict([(n, self.attr(n)) for n in attr_names])
-        return res
+        return {n: self.attr(n) for n in attr_names}
 
     def set_attr(self, **kwargs):
         """Set the attribute of the Booster.
@@ -1021,7 +1255,7 @@ class Booster(object):
         value: optional
            value of the specified parameter, when params is str key
         """
-        if isinstance(params, collections.Mapping):
+        if isinstance(params, Mapping):
             params = params.items()
         elif isinstance(params, STRING_TYPES) and value is not None:
             params = [(params, value)]
@@ -1029,8 +1263,8 @@ class Booster(object):
             _check_call(_LIB.XGBoosterSetParam(self.handle, c_str(key), c_str(str(val))))
 
     def update(self, dtrain, iteration, fobj=None):
-        """
-        Update for one iteration, with objective function calculated internally.
+        """Update for one iteration, with objective function calculated
+        internally.  This function should not be called directly by users.
 
         Parameters
         ----------
@@ -1040,6 +1274,7 @@ class Booster(object):
             Current iteration number.
         fobj : function
             Customized objective function.
+
         """
         if not isinstance(dtrain, DMatrix):
             raise TypeError('invalid training matrix: {}'.format(type(dtrain).__name__))
@@ -1054,8 +1289,9 @@ class Booster(object):
             self.boost(dtrain, grad, hess)
 
     def boost(self, dtrain, grad, hess):
-        """
-        Boost the booster for one iteration, with customized gradient statistics.
+        """Boost the booster for one iteration, with customized gradient
+        statistics.  Like :func:`xgboost.core.Booster.update`, this
+        function should not be called directly by users.
 
         Parameters
         ----------
@@ -1065,6 +1301,7 @@ class Booster(object):
             The first order of gradient.
         hess : list
             The second order of gradient.
+
         """
         if len(grad) != len(hess):
             raise ValueError('grad / hess length mismatch: {} / {}'.format(len(grad), len(hess)))
@@ -1146,8 +1383,7 @@ class Booster(object):
     def predict(self, data, output_margin=False, ntree_limit=0, pred_leaf=False,
                 pred_contribs=False, approx_contribs=False, pred_interactions=False,
                 validate_features=True):
-        """
-        Predict with data.
+        """Predict with data.
 
         .. note:: This function is not thread safe.
 
@@ -1200,8 +1436,9 @@ class Booster(object):
             value of the prediction. Note the last row and column correspond to the bias term.
 
         validate_features : bool
-            When this is True, validate that the Booster's and data's feature_names are identical.
-            Otherwise, it is assumed that the feature_names are the same.
+            When this is True, validate that the Booster's and data's
+            feature_names are identical.  Otherwise, it is assumed that the
+            feature_names are the same.
 
         Returns
         -------
@@ -1218,6 +1455,10 @@ class Booster(object):
             option_mask |= 0x08
         if pred_interactions:
             option_mask |= 0x10
+
+        if not isinstance(data, DMatrix):
+            raise TypeError('Expecting data to be a DMatrix object, got: ',
+                            type(data))
 
         if validate_features:
             self._validate_features(data)
@@ -1253,27 +1494,27 @@ class Booster(object):
         return preds
 
     def save_model(self, fname):
-        """
-        Save the model to a file.
+        """Save the model to a file.
 
-        The model is saved in an XGBoost internal binary format which is
-        universal among the various XGBoost interfaces. Auxiliary attributes of
-        the Python Booster object (such as feature_names) will not be saved.
-        To preserve all attributes, pickle the Booster object.
+        The model is saved in an XGBoost internal format which is universal
+        among the various XGBoost interfaces. Auxiliary attributes of the
+        Python Booster object (such as feature_names) will not be saved.  To
+        preserve all attributes, pickle the Booster object.
 
         Parameters
         ----------
-        fname : string
+        fname : string or os.PathLike
             Output file name
+
         """
-        if isinstance(fname, STRING_TYPES):  # assume file name
-            _check_call(_LIB.XGBoosterSaveModel(self.handle, c_str(fname)))
+        if isinstance(fname, (STRING_TYPES, os_PathLike)):  # assume file name
+            _check_call(_LIB.XGBoosterSaveModel(
+                self.handle, c_str(os_fspath(fname))))
         else:
-            raise TypeError("fname must be a string")
+            raise TypeError("fname must be a string or os_PathLike")
 
     def save_raw(self):
-        """
-        Save the model to a in memory buffer representation
+        """Save the model to a in memory buffer representation
 
         Returns
         -------
@@ -1287,76 +1528,74 @@ class Booster(object):
         return ctypes2buffer(cptr, length.value)
 
     def load_model(self, fname):
-        """
-        Load the model from a file.
+        """Load the model from a file, local or as URI.
 
-        The model is loaded from an XGBoost internal binary format which is
-        universal among the various XGBoost interfaces. Auxiliary attributes of
-        the Python Booster object (such as feature_names) will not be loaded.
-        To preserve all attributes, pickle the Booster object.
+        The model is loaded from an XGBoost format which is universal among the
+        various XGBoost interfaces. Auxiliary attributes of the Python Booster
+        object (such as feature_names) will not be loaded.  To preserve all
+        attributes, pickle the Booster object.
 
         Parameters
         ----------
-        fname : string or a memory buffer
+        fname : string, os.PathLike, or a memory buffer
             Input file name or memory buffer(see also save_raw)
+
         """
-        if isinstance(fname, STRING_TYPES):
-            # assume file name, cannot use os.path.exist to check, file can be from URL.
-            _check_call(_LIB.XGBoosterLoadModel(self.handle, c_str(fname)))
+        if isinstance(fname, (STRING_TYPES, os_PathLike)):
+            # assume file name, cannot use os.path.exist to check, file can be
+            # from URL.
+            _check_call(_LIB.XGBoosterLoadModel(
+                self.handle, c_str(os_fspath(fname))))
         else:
-            buf = fname
-            length = c_bst_ulong(len(buf))
-            ptr = (ctypes.c_char * len(buf)).from_buffer(buf)
-            _check_call(_LIB.XGBoosterLoadModelFromBuffer(self.handle, ptr, length))
+            raise TypeError('Unknown file type: ', fname)
 
     def dump_model(self, fout, fmap='', with_stats=False, dump_format="text"):
-        """
-        Dump model into a text or JSON file.
+        """Dump model into a text or JSON file.
 
         Parameters
         ----------
-        fout : string
+        fout : string or os.PathLike
             Output file name.
-        fmap : string, optional
+        fmap : string or os.PathLike, optional
             Name of the file containing feature map names.
         with_stats : bool, optional
             Controls whether the split statistics are output.
         dump_format : string, optional
             Format of model dump file. Can be 'text' or 'json'.
         """
-        if isinstance(fout, STRING_TYPES):
-            fout = open(fout, 'w')
+        if isinstance(fout, (STRING_TYPES, os_PathLike)):
+            fout = open(os_fspath(fout), 'w')
             need_close = True
         else:
             need_close = False
         ret = self.get_dump(fmap, with_stats, dump_format)
         if dump_format == 'json':
             fout.write('[\n')
-            for i in range(len(ret)):
+            for i, _ in enumerate(ret):
                 fout.write(ret[i])
                 if i < len(ret) - 1:
                     fout.write(",\n")
             fout.write('\n]')
         else:
-            for i in range(len(ret)):
+            for i, _ in enumerate(ret):
                 fout.write('booster[{}]:\n'.format(i))
                 fout.write(ret[i])
         if need_close:
             fout.close()
 
     def get_dump(self, fmap='', with_stats=False, dump_format="text"):
-        """
-        Returns the model dump as a list of strings.
+        """Returns the model dump as a list of strings.
 
         Parameters
         ----------
-        fmap : string, optional
+        fmap : string or os.PathLike, optional
             Name of the file containing feature map names.
         with_stats : bool, optional
             Controls whether the split statistics are output.
         dump_format : string, optional
-            Format of model dump. Can be 'text' or 'json'.
+            Format of model dump. Can be 'text', 'json' or 'dot'.
         """
+        fmap = os_fspath(fmap)
         length = c_bst_ulong()
         sarr = ctypes.POINTER(ctypes.c_char_p)()
         if self.feature_names is not None and fmap == '':
@@ -1407,7 +1646,7 @@ class Booster(object):
 
         Parameters
         ----------
-        fmap: str (optional)
+        fmap: str or os.PathLike (optional)
            The name of feature map file
         """
 
@@ -1431,13 +1670,13 @@ class Booster(object):
 
         Parameters
         ----------
-        fmap: str (optional)
+        fmap: str or os.PathLike (optional)
            The name of feature map file.
         importance_type: str, default 'weight'
             One of the importance types defined above.
         """
-
-        if self.booster != 'gbtree':
+        fmap = os_fspath(fmap)
+        if getattr(self, 'booster', None) is not None and self.booster not in {'gbtree', 'dart'}:
             raise ValueError('Feature importance is not defined for Booster type {}'
                              .format(self.booster))
 
@@ -1472,51 +1711,136 @@ class Booster(object):
 
             return fmap
 
-        else:
-            average_over_splits = True
-            if importance_type == 'total_gain':
-                importance_type = 'gain'
-                average_over_splits = False
-            elif importance_type == 'total_cover':
-                importance_type = 'cover'
-                average_over_splits = False
+        average_over_splits = True
+        if importance_type == 'total_gain':
+            importance_type = 'gain'
+            average_over_splits = False
+        elif importance_type == 'total_cover':
+            importance_type = 'cover'
+            average_over_splits = False
 
-            trees = self.get_dump(fmap, with_stats=True)
+        trees = self.get_dump(fmap, with_stats=True)
 
-            importance_type += '='
-            fmap = {}
-            gmap = {}
-            for tree in trees:
-                for line in tree.split('\n'):
-                    # look for the opening square bracket
-                    arr = line.split('[')
-                    # if no opening bracket (leaf node), ignore this line
-                    if len(arr) == 1:
+        importance_type += '='
+        fmap = {}
+        gmap = {}
+        for tree in trees:
+            for line in tree.split('\n'):
+                # look for the opening square bracket
+                arr = line.split('[')
+                # if no opening bracket (leaf node), ignore this line
+                if len(arr) == 1:
+                    continue
+
+                # look for the closing bracket, extract only info within that bracket
+                fid = arr[1].split(']')
+
+                # extract gain or cover from string after closing bracket
+                g = float(fid[1].split(importance_type)[1].split(',')[0])
+
+                # extract feature name from string before closing bracket
+                fid = fid[0].split('<')[0]
+
+                if fid not in fmap:
+                    # if the feature hasn't been seen yet
+                    fmap[fid] = 1
+                    gmap[fid] = g
+                else:
+                    fmap[fid] += 1
+                    gmap[fid] += g
+
+        # calculate average value (gain/cover) for each feature
+        if average_over_splits:
+            for fid in gmap:
+                gmap[fid] = gmap[fid] / fmap[fid]
+
+        return gmap
+
+    def trees_to_dataframe(self, fmap=''):
+        """Parse a boosted tree model text dump into a pandas DataFrame structure.
+
+        This feature is only defined when the decision tree model is chosen as base
+        learner (`booster in {gbtree, dart}`). It is not defined for other base learner
+        types, such as linear learners (`booster=gblinear`).
+
+        Parameters
+        ----------
+        fmap: str or os.PathLike (optional)
+           The name of feature map file.
+        """
+        # pylint: disable=too-many-locals
+        fmap = os_fspath(fmap)
+        if not PANDAS_INSTALLED:
+            raise Exception(('pandas must be available to use this method.'
+                             'Install pandas before calling again.'))
+
+        if getattr(self, 'booster', None) is not None and self.booster not in {'gbtree', 'dart'}:
+            raise ValueError('This method is not defined for Booster type {}'
+                             .format(self.booster))
+
+        tree_ids = []
+        node_ids = []
+        fids = []
+        splits = []
+        y_directs = []
+        n_directs = []
+        missings = []
+        gains = []
+        covers = []
+
+        trees = self.get_dump(fmap, with_stats=True)
+        for i, tree in enumerate(trees):
+            for line in tree.split('\n'):
+                arr = line.split('[')
+                # Leaf node
+                if len(arr) == 1:
+                    # Last element of line.split is an empy string
+                    if arr == ['']:
                         continue
+                    # parse string
+                    parse = arr[0].split(':')
+                    stats = re.split('=|,', parse[1])
 
-                    # look for the closing bracket, extract only info within that bracket
+                    # append to lists
+                    tree_ids.append(i)
+                    node_ids.append(int(re.findall(r'\b\d+\b', parse[0])[0]))
+                    fids.append('Leaf')
+                    splits.append(float('NAN'))
+                    y_directs.append(float('NAN'))
+                    n_directs.append(float('NAN'))
+                    missings.append(float('NAN'))
+                    gains.append(float(stats[1]))
+                    covers.append(float(stats[3]))
+                # Not a Leaf Node
+                else:
+                    # parse string
                     fid = arr[1].split(']')
+                    parse = fid[0].split('<')
+                    stats = re.split('=|,', fid[1])
 
-                    # extract gain or cover from string after closing bracket
-                    g = float(fid[1].split(importance_type)[1].split(',')[0])
+                    # append to lists
+                    tree_ids.append(i)
+                    node_ids.append(int(re.findall(r'\b\d+\b', arr[0])[0]))
+                    fids.append(parse[0])
+                    splits.append(float(parse[1]))
+                    str_i = str(i)
+                    y_directs.append(str_i + '-' + stats[1])
+                    n_directs.append(str_i + '-' + stats[3])
+                    missings.append(str_i + '-' + stats[5])
+                    gains.append(float(stats[7]))
+                    covers.append(float(stats[9]))
 
-                    # extract feature name from string before closing bracket
-                    fid = fid[0].split('<')[0]
+        ids = [str(t_id) + '-' + str(n_id) for t_id, n_id in zip(tree_ids, node_ids)]
+        df = DataFrame({'Tree': tree_ids, 'Node': node_ids, 'ID': ids,
+                        'Feature': fids, 'Split': splits, 'Yes': y_directs,
+                        'No': n_directs, 'Missing': missings, 'Gain': gains,
+                        'Cover': covers})
 
-                    if fid not in fmap:
-                        # if the feature hasn't been seen yet
-                        fmap[fid] = 1
-                        gmap[fid] = g
-                    else:
-                        fmap[fid] += 1
-                        gmap[fid] += g
-
-            # calculate average value (gain/cover) for each feature
-            if average_over_splits:
-                for fid in gmap:
-                    gmap[fid] = gmap[fid] / fmap[fid]
-
-            return gmap
+        if callable(getattr(df, 'sort_values', None)):
+            # pylint: disable=no-member
+            return df.sort_values(['Tree', 'Node']).reset_index(drop=True)
+        # pylint: disable=no-member
+        return df.sort(['Tree', 'Node']).reset_index(drop=True)
 
     def _validate_features(self, data):
         """
@@ -1535,8 +1859,8 @@ class Booster(object):
                 msg = 'feature_names mismatch: {0} {1}'
 
                 if dat_missing:
-                    msg += ('\nexpected ' + ', '.join(str(s) for s in dat_missing) +
-                            ' in input data')
+                    msg += ('\nexpected ' + ', '.join(
+                        str(s) for s in dat_missing) + ' in input data')
 
                 if my_missing:
                     msg += ('\ntraining data did not have the following fields: ' +
@@ -1545,14 +1869,15 @@ class Booster(object):
                 raise ValueError(msg.format(self.feature_names,
                                             data.feature_names))
 
-    def get_split_value_histogram(self, feature, fmap='', bins=None, as_pandas=True):
+    def get_split_value_histogram(self, feature, fmap='', bins=None,
+                                  as_pandas=True):
         """Get split value histogram of a feature
 
         Parameters
         ----------
         feature: str
             The name of the feature.
-        fmap: str (optional)
+        fmap: str or os.PathLike (optional)
             The name of feature map file.
         bin: int, default None
             The maximum number of bins.
@@ -1570,9 +1895,9 @@ class Booster(object):
         xgdump = self.get_dump(fmap=fmap)
         values = []
         regexp = re.compile(r"\[{0}<([\d.Ee+-]+)\]".format(feature))
-        for i in range(len(xgdump)):
+        for i, _ in enumerate(xgdump):
             m = re.findall(regexp, xgdump[i])
-            values.extend(map(float, m))
+            values.extend([float(x) for x in m])
 
         n_unique = len(np.unique(values))
         bins = max(min(n_unique, bins) if bins is not None else n_unique, 1)
@@ -1583,9 +1908,7 @@ class Booster(object):
 
         if as_pandas and PANDAS_INSTALLED:
             return DataFrame(nph, columns=['SplitValue', 'Count'])
-        elif as_pandas and not PANDAS_INSTALLED:
+        if as_pandas and not PANDAS_INSTALLED:
             sys.stderr.write(
                 "Returning histogram as ndarray (as_pandas == True, but pandas is not installed).")
-            return nph
-        else:
-            return nph
+        return nph

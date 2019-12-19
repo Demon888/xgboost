@@ -10,13 +10,16 @@
 #include <dmlc/omp.h>
 #include <cmath>
 #include <iostream>
+#include <vector>
+#include <string>
+#include <utility>
 
 /*!
  * \brief string flag for R library, to leave hooks when needed.
  */
 #ifndef XGBOOST_STRICT_R_MODE
 #define XGBOOST_STRICT_R_MODE 0
-#endif
+#endif  // XGBOOST_STRICT_R_MODE
 
 /*!
  * \brief Whether always log console message with time.
@@ -26,21 +29,21 @@
  */
 #ifndef XGBOOST_LOG_WITH_TIME
 #define XGBOOST_LOG_WITH_TIME 1
-#endif
+#endif  // XGBOOST_LOG_WITH_TIME
 
 /*!
  * \brief Whether customize the logger outputs.
  */
 #ifndef XGBOOST_CUSTOMIZE_LOGGER
 #define XGBOOST_CUSTOMIZE_LOGGER XGBOOST_STRICT_R_MODE
-#endif
+#endif  // XGBOOST_CUSTOMIZE_LOGGER
 
 /*!
  * \brief Whether to customize global PRNG.
  */
 #ifndef XGBOOST_CUSTOMIZE_GLOBAL_PRNG
 #define XGBOOST_CUSTOMIZE_GLOBAL_PRNG XGBOOST_STRICT_R_MODE
-#endif
+#endif  // XGBOOST_CUSTOMIZE_GLOBAL_PRNG
 
 /*!
  * \brief Check if alignas(*) keyword is supported. (g++ 4.8 or higher)
@@ -49,7 +52,7 @@
 #define XGBOOST_ALIGNAS(X) alignas(X)
 #else
 #define XGBOOST_ALIGNAS(X)
-#endif
+#endif  // defined(__GNUC__) && ((__GNUC__ == 4 && __GNUC_MINOR__ >= 8) || __GNUC__ > 4)
 
 #if defined(__GNUC__) && ((__GNUC__ == 4 && __GNUC_MINOR__ >= 8) || __GNUC__ > 4) && \
     !defined(__CUDACC__)
@@ -64,7 +67,13 @@
 #else
 #define XGBOOST_PARALLEL_SORT(X, Y, Z) std::sort((X), (Y), (Z))
 #define XGBOOST_PARALLEL_STABLE_SORT(X, Y, Z) std::stable_sort((X), (Y), (Z))
-#endif
+#endif  // GLIBC VERSION
+
+#if defined(__GNUC__)
+#define XGBOOST_EXPECT(cond, ret)  __builtin_expect((cond), (ret))
+#else
+#define XGBOOST_EXPECT(cond, ret) (cond)
+#endif  // defined(__GNUC__)
 
 /*!
  * \brief Tag function as usable by device
@@ -73,20 +82,47 @@
 #define XGBOOST_DEVICE __host__ __device__
 #else
 #define XGBOOST_DEVICE
-#endif
+#endif  // defined (__CUDA__) || defined(__NVCC__)
+
+// These check are for Makefile.
+#if !defined(XGBOOST_MM_PREFETCH_PRESENT) && !defined(XGBOOST_BUILTIN_PREFETCH_PRESENT)
+/* default logic for software pre-fetching */
+#if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_AMD64))) || defined(__INTEL_COMPILER)
+// Enable _mm_prefetch for Intel compiler and MSVC+x86
+  #define XGBOOST_MM_PREFETCH_PRESENT
+  #define XGBOOST_BUILTIN_PREFETCH_PRESENT
+#elif defined(__GNUC__)
+// Enable __builtin_prefetch for GCC
+#define XGBOOST_BUILTIN_PREFETCH_PRESENT
+#endif  // GUARDS
+
+#endif  // !defined(XGBOOST_MM_PREFETCH_PRESENT) && !defined()
 
 /*! \brief namespace of xgboost*/
 namespace xgboost {
-/*!
- * \brief unsigned integer type used in boost,
- *  used for feature index and row index.
- */
+
+/*! \brief unsigned integer type used for feature index. */
 using bst_uint = uint32_t;  // NOLINT
+/*! \brief integer type. */
 using bst_int = int32_t;    // NOLINT
-/*! \brief long integers */
-typedef uint64_t bst_ulong;  // NOLINT(*)
+/*! \brief unsigned long integers */
+using bst_ulong = uint64_t;
 /*! \brief float type, used for storing statistics */
 using bst_float = float;  // NOLINT
+
+/*! \brief Type for data column (feature) index. */
+using bst_feature_t = uint32_t;  // NOLINT
+/*! \brief Type for data row index.
+ *
+ * Be careful `std::size_t' is implementation-defined.  Meaning that the binary
+ * representation of DMatrix might not be portable across platform.  Booster model should
+ * be portable as parameters are floating points.
+ */
+using bst_row_t = std::size_t;   // NOLINT
+/*! \brief Type for tree node index. */
+using bst_node_t = int32_t;      // NOLINT
+/*! \brief Type for ranking group index. */
+using bst_group_t = uint32_t;    // NOLINT
 
 namespace detail {
 /*! \brief Implementation of gradient statistics pair. Template specialisation
@@ -199,13 +235,17 @@ using GradientPairPrecise = detail::GradientPairInternal<double>;
  * associative. */
 using GradientPairInteger = detail::GradientPairInternal<int64_t>;
 
+using Args = std::vector<std::pair<std::string, std::string> >;
+
 /*! \brief small eps gap for minimum split decision. */
-const bst_float kRtEps = 1e-6f;
+constexpr bst_float kRtEps = 1e-6f;
 
 /*! \brief define unsigned long for openmp loop */
 using omp_ulong = dmlc::omp_ulong;  // NOLINT
 /*! \brief define unsigned int for openmp loop */
 using bst_omp_uint = dmlc::omp_uint;  // NOLINT
+/*! \brief Type used for representing version number in binary form.*/
+using XGBoostVersionT = int32_t;
 
 /*!
  * \brief define compatible keywords in g++
@@ -215,7 +255,8 @@ using bst_omp_uint = dmlc::omp_uint;  // NOLINT
 #if __GNUC__ == 4 && __GNUC_MINOR__ < 8
 #define override
 #define final
-#endif
-#endif
+#endif  // __GNUC__ == 4 && __GNUC_MINOR__ < 8
+#endif  // DMLC_USE_CXX11 && defined(__GNUC__) && !defined(__clang_version__)
 }  // namespace xgboost
+
 #endif  // XGBOOST_BASE_H_

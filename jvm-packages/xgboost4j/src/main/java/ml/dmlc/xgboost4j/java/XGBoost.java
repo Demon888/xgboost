@@ -140,6 +140,8 @@ public class XGBoost {
     //collect eval matrixs
     String[] evalNames;
     DMatrix[] evalMats;
+    float bestScore;
+    int bestIteration;
     List<String> names = new ArrayList<String>();
     List<DMatrix> mats = new ArrayList<DMatrix>();
 
@@ -150,6 +152,12 @@ public class XGBoost {
 
     evalNames = names.toArray(new String[names.size()]);
     evalMats = mats.toArray(new DMatrix[mats.size()]);
+    if (isMaximizeEvaluation(params)) {
+      bestScore = -Float.MAX_VALUE;
+    } else {
+      bestScore = Float.MAX_VALUE;
+    }
+    bestIteration = 0;
     metrics = metrics == null ? new float[evalNames.length][round] : metrics;
 
     //collect all data matrixs
@@ -196,17 +204,34 @@ public class XGBoost {
         for (int i = 0; i < metricsOut.length; i++) {
           metrics[i][iter] = metricsOut[i];
         }
+
+        // If there is more than one evaluation datasets, the last one would be used
+        // to determinate early stop.
+        float score = metricsOut[metricsOut.length - 1];
+        if (isMaximizeEvaluation(params)) {
+          // Update best score if the current score is better (no update when equal)
+          if (score > bestScore) {
+            bestScore = score;
+            bestIteration = iter;
+          }
+        } else {
+          if (score < bestScore) {
+            bestScore = score;
+            bestIteration = iter;
+          }
+        }
         if (earlyStoppingRounds > 0) {
-          boolean onTrack = judgeIfTrainingOnTrack(params, earlyStoppingRounds, metrics, iter);
-          if (!onTrack) {
-            String reversedDirection = getReversedDirection(params);
+          if (shouldEarlyStop(earlyStoppingRounds, iter, bestIteration)) {
             Rabit.trackerPrint(String.format(
-                    "early stopping after %d %s rounds", earlyStoppingRounds, reversedDirection));
+                    "early stopping after %d rounds away from the best iteration",
+                        earlyStoppingRounds));
             break;
           }
         }
-        if (Rabit.getRank() == 0) {
-          Rabit.trackerPrint(evalInfo + '\n');
+        if (Rabit.getRank() == 0 && shouldPrint(params, iter)) {
+          if (shouldPrint(params, iter)){
+            Rabit.trackerPrint(evalInfo + '\n');
+          }
         }
       }
       booster.saveRabitCheckpoint();
@@ -214,30 +239,52 @@ public class XGBoost {
     return booster;
   }
 
-  static boolean judgeIfTrainingOnTrack(
-          Map<String, Object> params, int earlyStoppingRounds, float[][] metrics, int iter) {
-    boolean maximizeEvaluationMetrics = getMetricsExpectedDirection(params);
-    boolean onTrack = false;
-    float[] criterion = metrics[metrics.length - 1];
-    for (int shift = 0; shift < Math.min(iter, earlyStoppingRounds) - 1; shift++) {
-      onTrack |= maximizeEvaluationMetrics ?
-              criterion[iter - shift] >= criterion[iter - shift - 1] :
-              criterion[iter - shift] <= criterion[iter - shift - 1];
+  private static Integer tryGetIntFromObject(Object o) {
+    if (o instanceof Integer) {
+      return (int)o;
+    } else if (o instanceof String) {
+      try {
+        return Integer.parseInt((String)o);
+      } catch (NumberFormatException e) {
+        return null;
+      }
+    } else {
+      return null;
     }
-    return onTrack;
   }
 
-  private static String getReversedDirection(Map<String, Object> params) {
-    String reversedDirection = null;
-    if (Boolean.valueOf(String.valueOf(params.get("maximize_evaluation_metrics")))) {
-      reversedDirection = "descending";
-    } else if (!Boolean.valueOf(String.valueOf(params.get("maximize_evaluation_metrics")))) {
-      reversedDirection = "ascending";
+  private static boolean shouldPrint(Map<String, Object> params, int iter) {
+    Object silent = params.get("silent");
+    Integer silentInt = tryGetIntFromObject(silent);
+    if (silent != null) {
+      if (silent.equals("true") || silent.equals("True")
+              || (silentInt != null && silentInt != 0)) {
+        return false;  // "silent" will stop printing, otherwise go look at "verbose_eval"
+      }
     }
-    return reversedDirection;
+
+    Object verboseEval = params.get("verbose_eval");
+    Integer verboseEvalInt = tryGetIntFromObject(verboseEval);
+    if (verboseEval == null) {
+      return true; // Default to printing evalInfo
+    } else if (verboseEval.equals("false") || verboseEval.equals("False")) {
+      return false;
+    } else if (verboseEvalInt != null) {
+      if (verboseEvalInt == 0) {
+        return false;
+      } else {
+        return iter % verboseEvalInt == 0;
+      }
+    } else {
+      return true; // Don't understand the option, default to printing
+    }
   }
 
-  private static boolean getMetricsExpectedDirection(Map<String, Object> params) {
+  static boolean shouldEarlyStop(int earlyStoppingRounds, int iter, int bestIteration) {
+    return iter - bestIteration >= earlyStoppingRounds;
+  }
+
+  private static boolean isMaximizeEvaluation(Map<String, Object> params) {
     try {
       String maximize = String.valueOf(params.get("maximize_evaluation_metrics"));
       assert(maximize != null);
